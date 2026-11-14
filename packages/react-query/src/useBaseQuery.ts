@@ -37,7 +37,8 @@ import type { UseBaseQueryOptions } from './types'
  * thrown to the nearest error boundary (see `throwOnError`). While suspending, it throws a promise instead.
  */
 // ═══ 中文注释导读 ═══
-// 这是「QueryObserver → React hook」的唯一映射点；useQuery / useInfiniteQuery /
+// 这是「QueryObserver → React hook」的常规映射点（useQueries 另有自己的 QueriesObserver，
+// 其 suspense 分支会临时 new 一个 QueryObserver，但不订阅）；useQuery / useInfiniteQuery /
 // useSuspenseQuery / useSuspenseInfiniteQuery 都只是传入不同 Observer 类的薄壳。
 // 一次渲染的顺序（也就是读这个文件的顺序）：
 //   1) 取 client、把 options 默认化（补 queryHash 等派生默认值）；

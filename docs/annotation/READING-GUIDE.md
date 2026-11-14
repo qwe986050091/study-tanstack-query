@@ -122,7 +122,9 @@
 
 ### 段 6 框架映射（`packages/react-query/src/useBaseQuery.ts`）
 
-- 入口：`useBaseQuery`（**唯一**创建 `QueryObserver` 的地方）。
+- 入口：`useBaseQuery`（常规 hook 路径创建 `QueryObserver` 的地方）。
+- 注意：`useQueries` 的 suspense 分支会**临时**再 new 一个不订阅的 `QueryObserver` 用于发一次 fetch
+  （`useQueries.ts` 的 `shouldAtLeastOneSuspend` 分支），别把它当成第二个常规入口。
 - 结束：`useSyncExternalStore` 的三个参数与最后的 `trackResult`。
 - 获得：一次渲染的固定顺序 ——
   默认化 options → 惰性创建 observer → `getOptimisticResult`（同步、可 build、不 fetch）
@@ -147,9 +149,9 @@
 | 流式数据 | `query-core/src/streamedQuery.ts` | 段 3（`setQueryData`）、段 1（signal 懒读取） |
 | Vue / Solid / Svelte / Angular / Lit / Preact 适配 | 见下方「各框架的对应文件」 | 段 6，映射方式与 React 同构 |
 
-**各框架的对应文件（已逐一核对调用点，不是推测）：**
+**各框架的对应文件（已逐一核对调用点，不是推测；只列常规 hook 路径）：**
 
-| 框架 | 创建 `QueryObserver` 的地方 | 调用 `client.mount()` 的地方 |
+| 框架 | 常规 hook 路径创建 `QueryObserver` 的地方 | 调用 `client.mount()` 的地方 |
 |---|---|---|
 | React | `packages/react-query/src/useBaseQuery.ts` | `QueryClientProvider.tsx` |
 | Preact | `packages/preact-query/src/useBaseQuery.ts` | `QueryClientProvider.tsx` |
@@ -161,6 +163,11 @@
 
 读这些文件时只需要盯三件事：**observer 在哪创建、订阅在哪发生、结果怎么映射成框架的响应式原语**
 （Vue 的 `shallowRef`、Solid 的 `createStore`、Svelte 的 `$state`、Angular 的 `signal`、Lit 的 controller）。
+
+另有三处**非 hook 常规路径**的创建点，读代码时可能撞上，别当成新机制：
+`query-core/src/queriesObserver.ts`（`useQueries` 每个子查询一个，属于常规路径但不在上表）、
+`react-query/src/useQueries.ts` 与 `preact-query/src/useQueries.ts` 的 suspense 分支（临时、不订阅）、
+`lit-query/src/createQueryController.ts`（controller 本身即入口，两处创建分别对应首次与重建）。
 
 ## 5. 可以跳过的部分
 
