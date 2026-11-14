@@ -288,6 +288,12 @@ export function useQuery<
   queryClient?: QueryClient,
 ): UseQueryResult<TData, TError>
 
+// ═══ 中文注释导读 ═══
+// 整个文件只有这一行有运行时逻辑：把 QueryObserver 交给 useBaseQuery。
+// 上面三个 export 的 useQuery 是「类型重载」，分别对应：
+//   initialData 确定为有值 → data 不为 undefined；initialData 可能为空 → data 可能为 undefined；
+//   兜底（options 类型不明确时）。它们没有函数体，读代码时可以整段跳过。
+// ──────────────────────
 export function useQuery(options: UseQueryOptions, queryClient?: QueryClient) {
   return useBaseQuery(options, QueryObserver, queryClient)
 }

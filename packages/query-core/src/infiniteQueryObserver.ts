@@ -37,6 +37,14 @@ type InfiniteQueryObserverListener<TData, TError> = (
  * const unsubscribe = observer.subscribe((result) => console.log(result))
  * ```
  */
+// ═══ 中文注释导读 ═══
+// InfiniteQueryObserver 是 QueryObserver 的子类，只做三处增量：
+//   1) 所有入口都把 options._type 标成 'infinite'（让 Query 选用无限查询 behavior）；
+//   2) 提供 fetchNextPage / fetchPreviousPage（本质是带 meta 的 fetch）；
+//   3) createResult 额外产出 hasNextPage / isFetchingNextPage 等方向相关字段。
+// 前两个「类型覆盖」块（subscribe / getCurrentResult / fetch）没有运行时逻辑，
+// 只是把父类签名收窄成无限查询的结果类型，读代码时可以直接跳过。
+// ──────────────────────
 export class InfiniteQueryObserver<
   TQueryFnData = unknown,
   TError = DefaultError,
@@ -105,6 +113,8 @@ export class InfiniteQueryObserver<
    * implementation.
    * @param options - The new infinite query observer options.
    */
+  // 标记 _type 必须在 super.setOptions 之前：父类会用它创建/更新 Query，
+  // 晚一步 Query.#queryType 就不会被设置，behavior 也选不到 infiniteQueryBehavior。
   override setOptions(
     options: InfiniteQueryObserverOptions<
       TQueryFnData,
@@ -162,6 +172,10 @@ export class InfiniteQueryObserver<
    * }
    * ```
    */
+  // 只是给 fetch 加 meta.fetchMore.direction。
+  // 这个 meta 会一路传到 Query.fetch 的 dispatch('fetch') → state.fetchMeta → behavior.onFetch，
+  // 是「同一套 fetch 流程如何表达取第几页」的唯一通道。
+  // cancelRefetch 默认 true：快速连点「下一页」会取消上一页请求（保持只有一次在途）。
   fetchNextPage(
     options?: FetchNextPageOptions,
   ): Promise<InfiniteQueryObserverResult<TData, TError>> {
@@ -204,6 +218,9 @@ export class InfiniteQueryObserver<
     })
   }
 
+  // 先拿父类结果，再叠加方向相关字段。fetchDirection 读自 state.fetchMeta ——
+  // 因此 isFetchingNextPage 能区分「整体在刷新」与「正在取下一页」，组件可以只给按钮加 loading。
+  // 最后两行是互相排斥处理：取下一页时不再算作 isRefetching/isRefetchError，避免 UI 重复提示。
   protected override createResult(
     query: Query<
       TQueryFnData,

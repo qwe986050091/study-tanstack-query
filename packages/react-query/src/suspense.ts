@@ -15,6 +15,8 @@ import type { QueryErrorResetBoundaryValue } from './QueryErrorResetBoundary'
  * @param query - The query that errored.
  * @returns `true` if the query has no data.
  */
+// suspense 场景的默认 throwOnError：只有在「没有数据可展示」时才把错误抛给 ErrorBoundary。
+// 有缓存数据时即使刷新失败，也应继续展示旧数据，而不是把整棵子树炸掉。
 export const defaultThrowOnError = <
   TQueryFnData = unknown,
   TError = DefaultError,
@@ -31,6 +33,10 @@ export const defaultThrowOnError = <
  * collected. A `'static'` `staleTime` is kept as is. Mutates the options.
  * @param defaultedOptions - The defaulted query options to adjust.
  */
+// suspense 特有的两个下限（1000ms）：
+//   staleTime：组件 suspend 后重挂载时不要立刻又判定 stale 并重取；
+//   gcTime：给「suspend 期间卸载 → 恢复后重新挂载」留出时间，避免缓存已被回收。
+// 它是就地修改（mutate）defaultedOptions，因为调用方拿到的就是这个对象。
 export const ensureSuspenseTimers = (
   defaultedOptions: DefaultedQueryObserverOptions<any, any, any, any, any>,
 ) => {
@@ -65,6 +71,7 @@ export const ensureSuspenseTimers = (
  * @param result - The current result of the observer.
  * @returns `true` if the component should suspend.
  */
+// 唯一条件：开了 suspense 且当前 result 仍是 pending（没有可渲染的数据）。
 export const shouldSuspend = (
   defaultedOptions:
     | DefaultedQueryObserverOptions<any, any, any, any, any>
@@ -80,6 +87,8 @@ export const shouldSuspend = (
  * @param errorResetBoundary - The value of the nearest `QueryErrorResetBoundary`.
  * @returns A promise that resolves once the fetch settles. It never rejects.
  */
+// 用 fetchOptimistic（而不是 ensureQueryData）是为了「不影响本 observer 的结果」；
+// 失败时 clearReset()：让 ErrorBoundary 处于「可捕获」状态，否则错误会被边界忽略。
 export const fetchOptimistic = <
   TQueryFnData,
   TError,

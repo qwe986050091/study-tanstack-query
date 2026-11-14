@@ -18,6 +18,8 @@ export const QueryClientContext = React.createContext<QueryClient | undefined>(
  * @throws {Error} If no `queryClient` argument is passed and no `QueryClientProvider` is found in the
  * component tree.
  */
+// 显式传入 queryClient 时优先用它（便于测试/多 client）；否则读 Context。
+// 抛错而不是返回 undefined：让「忘了包 Provider」在开发期立刻暴露。
 export const useQueryClient = (queryClient?: QueryClient) => {
   const client = React.useContext(QueryClientContext)
 
@@ -70,6 +72,9 @@ export const QueryClientProvider = ({
   client,
   children,
 }: QueryClientProviderProps): React.JSX.Element => {
+  // Provider 挂载 = client.mount()：这一刻才订阅 focus/online 事件。
+  // 卸载时 unmount() 引用计数减一；这就是「没有 Provider 时 refetchOnWindowFocus 不生效」的原因。
+  // effect 依赖 client：切换 client 会先 unmount 旧的再 mount 新的。
   React.useEffect(() => {
     client.mount()
     return () => {

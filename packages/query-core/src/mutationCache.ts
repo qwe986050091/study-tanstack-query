@@ -120,6 +120,12 @@ type MutationCacheListener = (event: MutationCacheNotifyEvent) => void
  * })
  * ```
  */
+// ═══ 中文注释导读 ═══
+// MutationCache = 全部 Mutation 的集合 + scope 队列 + 四个全局回调。
+// 与 QueryCache 最大的不同是没有「按 key 去重」：每次 mutate 都是一个新实例，只按 id 自增。
+// 唯一的串行机制是 scope：同一个 scope.id 的 mutation 同时只允许一个在跑，其余暂停排队。
+// 队列的实现非常轻：没有显式队列对象，直接依赖「Set 里的插入顺序 + 每次扫描第一个 pending」。
+// ──────────────────────
 export class MutationCache extends Subscribable<MutationCacheListener> {
   #mutations: Set<Mutation<any, any, any, any>>
   #scopes: Map<string, Array<Mutation<any, any, any, any>>>
@@ -164,6 +170,7 @@ export class MutationCache extends Subscribable<MutationCacheListener> {
    * @internal
    * @param mutation - The mutation to add. If it has a `scope`, it is queued in that scope.
    */
+  // 有 scope 才进 #scopes 索引；数组顺序就是提交顺序，canRun/runNext 都依赖它。
   add(mutation: Mutation<any, any, any, any>): void {
     this.#mutations.add(mutation)
     const scope = scopeFor(mutation)
@@ -213,6 +220,9 @@ export class MutationCache extends Subscribable<MutationCacheListener> {
    * @returns `true` if the mutation has no `scope`, or no other mutation in its scope is pending
    * ahead of it.
    */
+  // 判定「我能不能跑」：找到同 scope 的第一个 pending，如果就是自己（或没有）才放行。
+  // 两个使用场景：启动时（新 mutation 排到队尾）、continue 时（轮到它了）。
+  // 无 scope 的 mutation 永远放行。
   canRun(mutation: Mutation<any, any, any, any>): boolean {
     const scope = scopeFor(mutation)
     if (typeof scope === 'string') {
@@ -237,6 +247,9 @@ export class MutationCache extends Subscribable<MutationCacheListener> {
    * @returns A promise that resolves once the next paused mutation in the same scope has continued,
    * or immediately if there is none.
    */
+  // 当前 mutation 结束后，找同 scope 里「不是自己且 isPaused」的第一个，continue 它。
+  // 只找一个：它跑完会再触发自己的 runNext，从而形成链式推进。
+  // 恢复逻辑不在这里而在 Mutation.continue（可能重跑 execute，也可能继续 retryer）。
   runNext(mutation: Mutation<any, any, any, any>): Promise<unknown> {
     const scope = scopeFor(mutation)
     if (typeof scope === 'string') {
@@ -356,6 +369,9 @@ export class MutationCache extends Subscribable<MutationCacheListener> {
    * @internal
    * @returns A promise that resolves once every paused mutation has continued and settled.
    */
+  // 全局恢复：把所有 isPaused 的 mutation 都 continue 一次。
+  // 因为 canRun 会挡住非队首的，所以这里可以放心地并发调用 —— 实际仍按 scope 串行。
+  // 每个都 .catch(noop)：单个恢复失败不能中断其余 mutation。
   resumePausedMutations(): Promise<unknown> {
     const pausedMutations = this.getAll().filter((x) => x.state.isPaused)
 
@@ -372,6 +388,7 @@ export class MutationCache extends Subscribable<MutationCacheListener> {
  * @param mutation - The mutation to read the scope of.
  * @returns The mutation's `scope.id`, or `undefined` if it has no scope.
  */
+// scope 只认 options.scope.id（字符串）；scope 可以是用户对象，但索引键固定为 id。
 function scopeFor(mutation: Mutation<any, any, any, any>) {
   return mutation.options.scope?.id
 }

@@ -14,6 +14,8 @@ export type TimeoutCallback = (_: void) => void
  * typings add `NodeJS.Timeout`; but a non-default `timeoutManager` may not be
  * able to return such a type.
  */
+// 定时器 id 允许是对象：自定义 provider（如 Node 的 Timeout）返回的是对象。
+// 统一成「能隐式转成 number」的联合类型，是为了让业务侧可以 Number(id) 之后落日志。
 export type ManagedTimerId = number | { [Symbol.toPrimitive]: () => number }
 
 /**
@@ -48,6 +50,13 @@ export type TimeoutProvider<TTimerId extends ManagedTimerId = ManagedTimerId> =
 
 type SystemTimerId = ReturnType<typeof setTimeout>
 
+// ═══ 中文注释导读 ═══
+// 全库所有 gcTime / staleTime / refetchInterval / 重试退避的定时器都走这里，
+// 而不是直接调全局 setTimeout。这样做换来两个能力：
+//   1) 自定义 provider 可以把成千上万个长定时器做成「合并触发」，或支持超过 24 天的延迟；
+//   2) 测试里可以整体替换，不用 mock 全局。
+// 下面的 defaultTimeoutProvider 刻意用箭头函数包一层而不是直接引用全局函数，见注释。
+// ──────────────────────
 export const defaultTimeoutProvider: TimeoutProvider = {
   // We need the wrapper function syntax below instead of direct references to
   // global setTimeout etc.
@@ -59,6 +68,8 @@ export const defaultTimeoutProvider: TimeoutProvider = {
   // replace the global setTimeout (like tests) won't work since we'll already
   // have a hard reference to the original implementation at the time when this
   // file was imported.
+  // 必须是包装函数，不能写成 `setTimeout: setTimeout`。
+  // 直接引用会在 import 时把当时那份全局实现钉死，之后测试再替换全局 setTimeout 就不生效。
   setTimeout: (callback, delay) => setTimeout(callback, delay),
   clearTimeout: (timeoutId) =>
     clearTimeout(timeoutId as SystemTimerId | undefined),
@@ -115,6 +126,9 @@ export class TimeoutManager implements Omit<TimeoutProvider, 'name'> {
    * export const queryClient = new QueryClient()
    * ```
    */
+  // 切换 provider 是全局且不可逆的：不同 provider 的 id 空间不互通，
+  // 旧 provider 已排的定时器无法被新 provider 的 clearTimeout 正确取消（id 可能撞车，
+  // 于是变成取消掉别的定时器）。所以开发环境只在「切换前已用过 provider」时报警。
   setTimeoutProvider<TTimerId extends ManagedTimerId>(
     provider: TimeoutProvider<TTimerId>,
   ): void {
@@ -166,6 +180,7 @@ export class TimeoutManager implements Omit<TimeoutProvider, 'name'> {
    * const timeoutIdNumber: number = Number(timeoutId)
    * ```
    */
+  // 这里只做转发；#providerCalled 仅用于开发环境的误用检测。
   setTimeout(callback: TimeoutCallback, delay: number): ManagedTimerId {
     if (process.env.NODE_ENV !== 'production') {
       this.#providerCalled = true
@@ -245,6 +260,7 @@ export class TimeoutManager implements Omit<TimeoutProvider, 'name'> {
 /**
  * Singleton instance of {@link TimeoutManager}, used throughout TanStack Query to schedule and cancel timers.
  */
+// 单例：Removable、QueryObserver、retryer.sleep 共享同一个实例。
 export const timeoutManager = new TimeoutManager()
 
 /**
@@ -255,6 +271,8 @@ export const timeoutManager = new TimeoutManager()
  * incorrect use of system `setTimeout` easier.
  * @param callback - The function to call on the next event loop tick.
  */
+// 只给 notifyManager.defaultScheduler 用：「推到下一个宏任务」是调度语义，
+// 不属于「业务定时器」，所以故意绕过 timeoutManager，避免被自定义 provider 的合并策略改变顺序。
 export function systemSetTimeoutZero(callback: TimeoutCallback): void {
   setTimeout(callback, 0)
 }

@@ -281,6 +281,20 @@ export type Action<TData, TError> =
  * }
  * ```
  */
+// ═══ 中文注释导读（本文件是整条链路的核心，建议按下面 5 块读）═══
+// Query = 「一个 queryKey 对应的一份缓存 + 一个显式状态机」。它自己不会主动取数：
+//   · 谁触发 fetch？QueryObserver（首屏 / refetch / 定时器 / 聚焦）或 QueryClient 的命令式 API；
+//   · 谁读 state？QueryObserver.createResult 把 state 派生成组件用的 result；
+//   · 谁决定生死？Removable 的 gcTime 定时器 + observers 数量（见 optionalRemove）。
+// 建议顺序：
+//   ① 状态字段与构造（queryKey/state/#retryer/#revertState 各自代表什么）
+//   ② 状态迁移的唯一入口 #dispatch（8 个 action 的 reducer）
+//   ③ fetch()（去重 → 组装 context → retryer → 结算/取消）
+//   ④ 观察者生命周期（addObserver/removeObserver 与取消语义）
+//   ⑤ 纯查询型判定（isStale/isActive/isDisabled…，它们只是把 state 翻译成布尔值）
+// 一个必须记住的不变量：state 只能通过 #dispatch 修改（setData/setState/invalidate/fetch 内部都走它），
+// 因此「谁改了状态、改完之后通知了谁」永远只有一个答案。
+// ──────────────────────
 export class Query<
   TQueryFnData = unknown,
   TError = DefaultError,
@@ -294,9 +308,19 @@ export class Query<
   #queryType?: 'infinite'
 
   #initialState: QueryState<TData, TError>
+  // 取消回滚用的快照。三处写入，读的时候对照着看：
+  //   1) fetch 开始前保存当前 state；
+  //   2) success 且非 manual 时置 undefined（已经成功，没有可回滚的了）；
+  //   3) success 且 manual（setQueryData）时置为刚写入的新 state —— 这样后续 cancel({revert:true})
+  //      会回滚到「手动写入之后」而不是「手动写入之前」。
   #revertState?: QueryState<TData, TError>
   #cache: QueryCache
   #client: QueryClient
+  // #retryer 表示「此刻有一次在途 fetch」。它是判断能否复用在途请求、能否取消的唯一依据。
+  // fetch 结束时（finally）会在 `this.#retryer === retryer` 时清空，
+  // 这个同一性判断很重要：如果期间已有新 fetch 覆盖，旧 fetch 的收尾不能把新的 retryer 抹掉。
+  // #fetchPromise 与 #retryer.promise 不是同一个对象：前者是本文件包装后的 promise（带 setData、回调、错误分支），
+  // 后者是 retryer 内部的原始 promise。去重时返回的是 #fetchPromise。
   #retryer?: Retryer<TData>
   #fetchPromise?: Promise<TData>
   observers: Array<QueryObserver<any, any, any, any, any>>
@@ -306,8 +330,13 @@ export class Query<
   constructor(config: QueryConfig<TQueryFnData, TError, TData, TQueryKey>) {
     super()
 
+    // 是否「读过 signal」的标记。它决定 removeObserver 时是取消请求还是让请求跑完（见 removeObserver）。
+    // 每次 fetch 开始与 queryFn 调用前都会重置，避免上一次 fetch 的读取污染这一次。
     this.#abortSignalConsumed = false
     this.#defaultOptions = config.defaultOptions
+    // 注意构造顺序：setOptions 先跑，此时 this.state 还不存在，
+    // 所以 setOptions 里必须用 `if (this.state && ...)` 保护（源码里那条 oxlint-disable 就是为此）。
+    // 之后才创建 #initialState 与 state —— reset() 回滚的目标就是 #initialState。
     this.setOptions(config.options)
     this.observers = []
     this.#client = config.client
@@ -316,6 +345,8 @@ export class Query<
     this.queryHash = config.queryHash
     this.#initialState = getDefaultState(this.options)
     this.state = config.state ?? this.#initialState
+    // 新建即排 GC：一个从未被观察过的 query（例如只 build 没 subscribe）也会在 gcTime 后被回收。
+    // 一旦有 observer subscribe，QueryObserver.onSubscribe → query.addObserver → clearGcTimeout 取消它。
     this.scheduleGc()
   }
   /**
@@ -350,6 +381,9 @@ export class Query<
    * @internal
    * @param options - The new query options, merged on top of the query's default options.
    */
+  // 合并顺序：默认值（构造时传入的 defaultOptions）< 本次 options。
+  // initialData 只在「当前还没有 data」时生效，因此不会覆盖已经取到的真实数据；
+  // 生效时同步刷新 #initialState，保证之后的 reset() 会回到这份 initialData 而不是 undefined。
   setOptions(
     options?: QueryOptions<TQueryFnData, TError, TData, TQueryKey>,
   ): void {
@@ -373,6 +407,8 @@ export class Query<
     }
   }
 
+  // GC 到点后的最终判定：必须同时满足「没有 observer」与「不在 fetching」，否则放弃本次回收。
+  // 放弃时不再重新 scheduleGc —— 下一次 removeObserver / fetch 结束会重新排。
   protected override optionalRemove() {
     if (!this.observers.length && this.state.fetchStatus === 'idle') {
       this.#cache.remove(this)
@@ -387,6 +423,9 @@ export class Query<
    * manual (e.g. from `queryClient.setQueryData`).
    * @returns The data that was written.
    */
+  // 所有「写入成功数据」的路径都汇聚到这里：fetch 成功、setQueryData、hydration 恢复、streamedQuery 增量写。
+  // replaceData 做结构共享：新数据与旧数据深度相等时返回旧引用，于是本次 dispatch 产出的 state 变化最小，
+  // 下游 observer 的浅比较才有机会判定「没变化、不通知」。
   setData(
     newData: TData,
     options?: SetDataOptions & { manual: boolean },
@@ -410,6 +449,9 @@ export class Query<
    * user manually trigger a loading/error state or edit the cached data.
    * @param state - The partial state to merge into the query's state.
    */
+  // 直接合并部分 state，不做任何推导。用于：持久化/广播插件恢复快照、devtools 手动改状态、
+  // 以及本文件的 reset() 与取消回滚。
+  // 注意它是浅合并：传 data 时最好同时传 dataUpdatedAt，否则时间戳还是旧的。
   setState(state: Partial<QueryState<TData, TError>>): void {
     this.#dispatch({ type: 'setState', state })
   }
@@ -426,6 +468,9 @@ export class Query<
    * await query.cancel()
    * ```
    */
+  // 先取 promise 再 cancel：cancel 会同步 reject，之后再取就晚了。
+  // then(noop).catch(noop) 把「取消导致 reject」吞掉，返回的 promise 只表示「取消动作已结束」。
+  // 若当前没有在途 fetch，直接 resolve。
   cancel(options?: CancelOptions): Promise<void> {
     const promise = this.#retryer?.promise
     this.#retryer?.cancel(options)
@@ -438,6 +483,9 @@ export class Query<
    * the cache.
    * @see {@link Query#cancel}
    */
+  // destroy = 撤 GC 定时器 + 静默取消在途 fetch。
+  // 静默（silent）的含义见 retryer 的 CancelledError：不把取消当成错误抛给等待者。
+  // QueryCache.remove 调用的就是它，所以「removeQueries 会顺带打断请求」。
   override destroy(): void {
     super.destroy()
 
@@ -458,6 +506,8 @@ export class Query<
    * first created, e.g. any `initialData`), destroying it first to cancel any
    * in-flight fetch.
    */
+  // 先 destroy 再回到初始态：destroy 保证在途请求不会在 reset 之后又把数据写回来。
+  // resetState 是构造时的 #initialState（含 initialData），不是空状态。
   reset(): void {
     this.destroy()
     this.setState(this.resetState)
@@ -468,6 +518,8 @@ export class Query<
    * does not resolve to `false`.
    * @returns `true` if the query has an enabled observer.
    */
+  // 「有至少一个 observer 且其 enabled 不为 false」= active。
+  // QueryFilters.type: 'active' / refetchType 默认值都基于这个判定。
   isActive(): boolean {
     return this.observers.some(
       (observer) => resolveQueryValue(observer.options.enabled, this) !== false,
@@ -483,6 +535,10 @@ export class Query<
    *   `skipToken` or it has never been fetched.
    * @returns `true` if the query is disabled.
    */
+  // 两套判定，别混：
+  //   有 observer 时：等价于 !isActive()，即所有 observer 都 enabled:false；
+  //   没 observer 时：queryFn 是 skipToken，或从未成功/失败过一次（isFetched 为假）。
+  // refetchQueries 会先过滤掉 isDisabled 的 query，这条规则让「从未启用」的查询不会被命令式重取。
   isDisabled(): boolean {
     if (this.getObserversCount() > 0) {
       return !this.isActive()
@@ -496,6 +552,8 @@ export class Query<
    * either data or an error at least once.
    * @returns `true` if the query has been fetched.
    */
+  // 用「成功次数 + 失败次数 > 0」表示「尝试过」。
+  // 因此一个失败过的 query 也算 fetched —— 它决定了 retryOnMount、isFetchedAfterMount 等语义。
   isFetched() {
     return this.state.dataUpdateCount + this.state.errorUpdateCount > 0
   }
@@ -536,6 +594,9 @@ export class Query<
    * }
    * ```
    */
+  // 有 observer 时以 observer 的 result.isStale 为准：因为 staleTime 可以被每个 observer 覆盖，
+  // 同一个 query 对不同组件可能一个 stale 一个不 stale。
+  // 没 observer 时退回最粗的判定：没数据或已 invalidate。
   isStale(): boolean {
     // check observers first, their `isStale` has the source of truth
     // calculated with `isStaleByTime` and it takes `enabled` into account
@@ -564,6 +625,8 @@ export class Query<
    * const isStale = query.isStaleByTime(60 * 1000)
    * ```
    */
+  // 四步短路顺序：无数据 → 必 stale；'static' → 永 stale 为假；已 invalidate → 必 stale；最后才看时间差。
+  // invalidate 优先于 'static' 是刻意的：invalidate 是「人为宣告过期」，应压过配置。
   isStaleByTime(staleTime: StaleTime = 0): boolean {
     // no data is always stale
     if (this.state.data === undefined) {
@@ -586,6 +649,10 @@ export class Query<
    * paused fetch.
    * @internal
    */
+  // 聚焦重取的真实决策点：在 observers 里找第一个 shouldFetchOnWindowFocus() 为真的，
+  // 用它触发 refetch，且 cancelRefetch:false（不打断已在跑的请求）。
+  // 之后无条件 retryer.continue()：把因失焦而暂停的重试放行。
+  // onOnline 与之同构，只是谓词换成 shouldFetchOnReconnect()。
   onFocus(): void {
     const observer = this.observers.find((x) => x.shouldFetchOnWindowFocus())
 
@@ -615,6 +682,8 @@ export class Query<
    * @param observer - The observer to add. Adding an observer that is already subscribed does
    * nothing.
    */
+  // 第一个 observer 的到来会 clearGcTimeout —— 这就是「有人看就不回收」的实现点。
+  // 重复添加直接忽略（数组 includes 判重）。
   addObserver(observer: QueryObserver<any, any, any, any, any>): void {
     if (!this.observers.includes(observer)) {
       this.observers.push(observer)
@@ -633,6 +702,12 @@ export class Query<
    * fetch is cancelled if its abort signal was consumed (otherwise only its retries are stopped),
    * and garbage collection is scheduled.
    */
+  // 只有「最后一个 observer 离开」才处理在途请求，分三种情况：
+  //   a) queryFn 读过 signal，或 (paused 且 status=pending)：cancel({revert:true})，真正中断并回滚；
+  //   b) 否则 cancelRetry()：不中断当前请求，只禁止后续重试 —— 让结果仍能写入缓存，供下次挂载直接命中；
+  //   c) 没有 retryer：什么都不做。
+  // 最后 scheduleGc()：从现在开始倒计时回收。
+  // 这就是「组件卸载后请求还在跑」与「请求被取消」两种行为的唯一分叉点。
   removeObserver(observer: QueryObserver<any, any, any, any, any>): void {
     const index = this.observers.indexOf(observer)
     if (index !== -1) {
@@ -683,6 +758,8 @@ export class Query<
    * query.invalidate()
    * ```
    */
+  // 只改标记、不取数。真正重取由 QueryClient.invalidateQueries 之后的 refetchQueries 负责。
+  // 幂等：已经 invalidate 过就不再 dispatch，避免重复通知。
   invalidate(): void {
     if (!this.state.isInvalidated) {
       this.#dispatch({ type: 'invalidate' })
@@ -706,10 +783,17 @@ export class Query<
    * fetch is cancelled with `revert` while the query has data, it resolves with the restored data
    * instead.
    */
+  // ── ③ fetch：状态机的外部驱动入口 ──
+  // 完整顺序：复用判定 → 合并 options → 组装 AbortController/signal → 组装 fetchFn 与 context
+  //          → behavior.onFetch（无限查询改 fetchFn）→ 保存 revertState → dispatch('fetch')
+  //          → 建 retryer 并 start → 等 promise → 成功 setData / 失败 dispatch('error') → finally 清理。
   async fetch(
     options?: QueryOptions<TQueryFnData, TError, TData, TQueryKey>,
     fetchOptions?: FetchOptions<TQueryFnData>,
   ): Promise<TData> {
+    // 去重分支的前提：已经在 fetching/paused，且 retryer 没处于已 reject 状态。
+    // 「已 reject 还要重开」是个补丁：promise 已 reject 但 fetchStatus 可能还没回到 idle（异步间隙），
+    // 此时必须允许重新发起，否则会返回一个已失败的 promise。
     if (
       this.state.fetchStatus !== 'idle' &&
       // If the promise in the retryer is already rejected, we have to definitely
@@ -717,9 +801,14 @@ export class Query<
       // pending state when that happens
       this.#retryer?.status() !== 'rejected'
     ) {
+      // cancelRefetch 只在「已有 data」时打断旧请求；没有 data 时保留旧请求（首个数据比新请求更重要）。
+      // silent 表示这次取消不产生用户可见的错误。
+      // 注意这里没有 return：取消后继续往下走，新建一次 fetch。
       if (this.state.data !== undefined && fetchOptions?.cancelRefetch) {
         // Silently cancel current fetch if the user wants to cancel refetch
         this.cancel({ silent: true })
+      // 复用分支：直接返回同一个 #fetchPromise，这就是「同一 queryKey 并发只发一个请求」的落点。
+      // continueRetry() 是补偿：observer 卸载可能把重试关掉过（cancelRetry），有新观察者回来时重新打开。
       } else if (this.#retryer && this.#fetchPromise) {
         // make sure that retries that were potentially cancelled due to unmounts can continue
         this.#retryer.continueRetry()
@@ -735,6 +824,8 @@ export class Query<
 
     // Use the options from the first observer with a query function if no function is found.
     // This can happen when the query is hydrated or created with setQueryData.
+    // 补 queryFn：hydration 或 setQueryData 建出来的 query 没有 queryFn，
+    // 此时从任意一个带 queryFn 的 observer 借一份 options（refetch 依赖它）。
     if (!this.options.queryFn) {
       const observer = this.observers.find((x) => x.options.queryFn)
       if (observer) {
@@ -755,6 +846,9 @@ export class Query<
     // Adds an enumerable signal property to the object that
     // which sets abortSignalConsumed to true when the signal
     // is read.
+    // signal 用 getter 懒返回：read 时才把 #abortSignalConsumed 置 true。
+    // 同时用 Symbol 键挂一份原始 signal（enumerable 但不会序列化），供无限查询内部透传；读取它不计入消费。
+    // addConsumeAwareSignal（utils.ts）是同一套逻辑的复用版本，两处语义保持一致。
     const addSignalProperty = (object: object) => {
       Object.defineProperties(object, {
         [fetchSignal]: { value: abortController.signal, enumerable: true },
@@ -769,6 +863,9 @@ export class Query<
     }
 
     // Create fetch function
+    // fetchFn 是「这一次 fetch 的最小执行单元」，会被 retryer 每次重试重新调用。
+    // context 每次重建（含新的 signal getter），因此重试拿到的 signal 仍是同一个 abortController 的。
+    // persister 存在时，queryFn 被交给 persister 包装（离线持久化场景）。
     const fetchFn = () => {
       const queryFn = ensureQueryFn(this.options, fetchOptions)
 
@@ -825,6 +922,8 @@ export class Query<
 
     const context = createFetchContext()
 
+    // 行为钩子：无限查询在这里把 fetchFn 换成分页版本；普通查询用 options.behavior（自定义扩展点）。
+    // onFetch 必须同步执行完（它只改 context.fetchFn），真正的取数仍由 retryer 触发。
     const behavior =
       this.#queryType === 'infinite'
         ? (infiniteQueryBehavior(
@@ -834,6 +933,8 @@ export class Query<
     behavior?.onFetch(context, this as unknown as Query)
 
     // Store state in case the current fetch needs to be reverted
+    // 在 dispatch('fetch') 之前保存：撤销量要回到「开始取数之前」，而不是 fetching 中间态。
+    // 接着的 dispatch 只在 fetchStatus 非 idle 或 meta 变化时才发，避免重复通知（fetchMeta 用于无限查询方向）。
     this.#revertState = this.state
 
     // Set to fetching state if not already in it
@@ -845,6 +946,9 @@ export class Query<
     }
 
     // Try to fetch the data
+    // retryer 的四个回调全部翻译成 action，Query 自身不维护重试计数。
+    // onCancel 里：revert 型取消回滚到 #revertState 并把 fetchStatus 置 idle；最后一定 abort 掉底层请求。
+    // canRun: () => true —— 对 query 而言「能否运行」只由 networkMode 决定，没有 mutation 那种串行 scope。
     const retryer = (this.#retryer = createRetryer({
       initialPromise: fetchOptions?.initialPromise as
         | Promise<TData>
@@ -874,6 +978,12 @@ export class Query<
       canRun: () => true,
     }))
 
+    // 包装层负责把「retryer 的结果」翻译成「query 状态 + 缓存级回调」，并处理取消的三种姿态：
+    //   silent + 已被新 fetch 取代 → 返回新 fetch 的 promise（调用方无感）；
+    //   revert + 有 data → 返回 data（视为成功回滚）；
+    //   revert + 无 data → 继续抛 CancelledError（首个请求被取消，确实没有数据可给）。
+    // 成功路径：setData → 触发 cache.config.onSuccess/onSettled → 返回 data。
+    // 失败路径：dispatch('error') → 触发 onError/onSettled → 原样 rethrow。
     const fetchPromise = (async () => {
       try {
         const data = await retryer.promise
@@ -887,6 +997,8 @@ export class Query<
           throw new Error(`${this.queryHash} data is undefined`)
         }
 
+        // data === undefined 会被当成错误（上方有开发环境提示）：queryFn 必须返回值，
+        // 否则无法区分「成功但无数据」与「还没完成」。
         this.setData(data)
 
         // Notify cache callback
@@ -933,6 +1045,9 @@ export class Query<
         )
 
         throw error // rethrow the error for further handling
+      // 收尾三件事：清 #retryer/#fetchPromise（同一性判断防止覆盖新 fetch）、排 GC、
+      // 注释里提到的「pin 住 raw result」是真实的内存考虑：retryer 的 promise 会持有 fetch 的原始返回值，
+      // 不清掉就会在 query 生命周期内多留一份数据副本。
       } finally {
         // The settled retryer's promise would otherwise pin this fetch's raw
         // result (a second copy after structural sharing) for the query's lifetime
@@ -945,10 +1060,17 @@ export class Query<
       }
     })()
     this.#fetchPromise = fetchPromise
+    // 先赋值 #fetchPromise 再 start：start 可能同步进入 run，run 内部若失败会走到 catch，
+    // 那里需要读到最新的 #fetchPromise。
     retryer.start()
     return fetchPromise
   }
 
+  // ── ② #dispatch：整个文件的「状态写入唯一入口」 ──
+  // reducer 是纯函数（除 success 分支写 #revertState），之后统一做两件通知：
+  //   1) 同步遍历 observers 调 onQueryUpdate（observer 再自行 updateResult）；
+  //   2) 发 QueryCache 的 'updated' 事件（带 action，devtools/持久化据此判断发生了什么）。
+  // observers.slice() 是防御：通知过程中 observer 可能同步退订，直接遍历会跳过元素。
   #dispatch(action: Action<TData, TError>): void {
     const reducer = (
       state: QueryState<TData, TError>,
@@ -976,6 +1098,9 @@ export class Query<
             ...fetchState(state.data, this.options),
             fetchMeta: action.meta ?? null,
           }
+        // non-manual（真实 fetch 成功）：顺便把 fetchStatus 置 idle、清零失败计数/原因。
+        // manual（setQueryData）：保留当前 fetchStatus 与失败计数 —— 手动写数据不该影响在途请求的状态。
+        // 两者都会通过 successState 把 isInvalidated 置回 false。
         case 'success':
           const newState = {
             ...state,
@@ -992,6 +1117,9 @@ export class Query<
           this.#revertState = action.manual ? newState : undefined
 
           return newState
+        // 失败一定 isInvalidated = true：即使有旧数据，也标记为需要重新验证。
+        // 注意 status 直接变 'error'，但同时保留 state.data —— 这就是 isRefetchError（有数据但刷新失败）的来源。
+        // fetchStatus 置 idle 表示本轮取数结束，重试与否由 retryer 决定（retryer 内部还在跑时不会走到这里）。
         case 'error':
           const error = action.error
           return {
@@ -1007,6 +1135,7 @@ export class Query<
             // note that "no data" always means stale so we can set unconditionally here
             isInvalidated: true,
           }
+        // 只置标记，不动 data/status。
         case 'invalidate':
           return {
             ...state,
@@ -1042,6 +1171,9 @@ export class Query<
  * or `'paused'`.
  * @returns The partial query state for a starting fetch.
  */
+// dispatch('fetch') 与 QueryObserver.createResult 的乐观结果共用这份推导：
+// 无 data 时同时把 status 拉回 pending、error 清空（重新开始，而不是带着旧错误）；
+// fetchStatus 由 networkMode 决定：canFetch 为假则直接进入 'paused'。
 export function fetchState<
   TQueryFnData,
   TError,
@@ -1085,6 +1217,9 @@ function successState<TData>(data: TData | undefined, dataUpdatedAt?: number) {
  * @param options - The query options.
  * @returns The initial query state: `'success'` if `initialData` is set, otherwise `'pending'`.
  */
+// 初始态：有 initialData → status 'success' 且 dataUpdatedAt 取 initialDataUpdatedAt（可能为 0，
+// 表示「数据很旧」，从而让首次挂载必然 stale 并触发后台刷新）；没有 → 'pending'。
+// 注意 dataUpdatedAt 与 status 是配套的，devtools 里看到的「新鲜度」完全由这两个字段决定。
 function getDefaultState<
   TQueryFnData,
   TError,

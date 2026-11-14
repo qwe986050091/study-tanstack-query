@@ -353,6 +353,14 @@ export type QueriesResults<
  * }
  * ```
  */
+// ═══ 中文注释导读 ═══
+// useQueries 的结构与 useBaseQuery 平行，只是把「一个 observer」换成 QueriesObserver：
+//   useMemo 默认化整组 queries → ensureSuspenseTimers/ensurePreventErrorBoundaryRetry →
+//   useState 建 QueriesObserver → getOptimisticResult 拿三元组 → effect setQueries →
+//   useSyncExternalStore 订阅 → 逐个判断 suspense/error → getCombinedResult(trackResult())。
+// 本文件前面约 350 行全是类型体操（QueriesOptions/QueriesResults 的递归推导），没有运行时逻辑；
+// 只想读链路的话从 `export function useQueries` 开始即可。
+// ──────────────────────
 export function useQueries<
   T extends Array<any>,
   TCombinedResult = QueriesResults<T>,
@@ -388,6 +396,9 @@ export function useQueries<
   const errorResetBoundary = useQueryErrorResetBoundary()
   const subscribed = options.subscribed !== false
 
+  // 依赖数组里放 queries 本身：调用方通常每次渲染都新建数组，所以这里基本每次都会重算；
+  // 重算成本可接受，真正的开销在 QueriesObserver.setQueries 的匹配与浅比较。
+  // _optimisticResults 与 useBaseQuery 同义：先假装 fetching，避免首帧空态。
   const defaultedQueries = React.useMemo(
     () =>
       queries.map((opts) => {
@@ -425,6 +436,9 @@ export function useQueries<
   )
 
   // note: this must be called before useSyncExternalStore
+  // 三元组的分工：optimisticResult 用于 suspense/error 逐项判定；
+  // getCombinedResult 用于产出最终返回值（带 combine 记忆化）；
+  // trackResult 用于按需包属性追踪 Proxy（只对未配置 notifyOnChangeProps 的项生效）。
   const [optimisticResult, getCombinedResult, trackResult] =
     observer.getOptimisticResult(
       defaultedQueries,
@@ -451,6 +465,8 @@ export function useQueries<
     () => observer.getCurrentResult(),
   )
 
+  // suspense 是「整组」语义：只要有一个子查询该 suspend，就抛出所有待决 promise 的 Promise.all。
+  // 这里为了拿 options 临时 new 了 QueryObserver —— 它只用于发一次 fetch，不参与订阅。
   const shouldAtLeastOneSuspend = optimisticResult.some((result, index) =>
     shouldSuspend(defaultedQueries[index], result),
   )
@@ -470,6 +486,7 @@ export function useQueries<
   if (suspensePromises.length > 0) {
     throw Promise.all(suspensePromises)
   }
+  // 与 suspense 不同，错误只抛「第一个」：ErrorBoundary 一次只能处理一个错误。
   const firstSingleResultWhichShouldThrow = optimisticResult.find(
     (result, index) => {
       const query = defaultedQueries[index]
@@ -490,5 +507,6 @@ export function useQueries<
     throw firstSingleResultWhichShouldThrow.error
   }
 
+  // 先追踪再 combine：保证 combine 里读到的字段也计入追踪范围。
   return getCombinedResult(trackResult())
 }

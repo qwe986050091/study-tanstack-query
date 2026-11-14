@@ -137,11 +137,21 @@ export interface QueryStore {
  * })
  * ```
  */
+// ═══ 中文注释导读 ═══
+// QueryCache = 一个 Map<queryHash, Query> + 一组缓存级事件。
+// 它在链路里的三个职责：
+//   1) 去重的唯一入口：build() 先按 hash 查，查不到才 new Query，所以同一 hash 永远只有一个实例；
+//   2) 提供批量操作：find/findAll 是 invalidate/refetch/remove 等所有 QueryClient 方法的地基；
+//   3) 广播事件：added/removed/updated/observer* 供 devtools、持久化、broadcast 插件订阅。
+// 注意 QueryCache 自己不决定「什么时候取数」，它只是存储与筛选；取数决策在 QueryObserver。
+// ──────────────────────
 export class QueryCache extends Subscribable<QueryCacheListener> {
   #queries: QueryStore
 
   constructor(public config: QueryCacheConfig = {}) {
     super()
+    // 键是 queryHash（utils.hashKey 的产物），不是 queryKey 数组。
+    // 这解释了为什么 queryKey 里对象的键顺序不影响去重、而数组顺序会影响。
     this.#queries = new Map<string, Query>()
   }
 
@@ -166,6 +176,10 @@ export class QueryCache extends Subscribable<QueryCacheListener> {
    * })
    * ```
    */
+  // get-or-create。三件事必须按顺序：先算 hash → 查已有 → 用 client 的默认值造新 Query。
+  // 传 state 的场景只有 hydration / broadcast 恢复；已有 query 时 state 被忽略（不覆盖运行中的真实状态）。
+  // 新 Query 同时拿到两份默认值：client.defaultQueryOptions(options) 是「本次调用的完整默认值」，
+  // getQueryDefaults(queryKey) 是「按 key 前缀注册的那份」，两者在 Query 内部再合并。
   build<
     TQueryFnData = unknown,
     TError = DefaultError,
@@ -205,6 +219,7 @@ export class QueryCache extends Subscribable<QueryCacheListener> {
    * @param query - The query to add. If a query with the same hash is already cached, nothing
    * happens.
    */
+  // 同 hash 已存在就什么都不做（并静默丢弃新实例），保证「一个 hash 一个 Query」不变量。
   add(query: Query<any, any, any, any>): void {
     if (!this.#queries.has(query.queryHash)) {
       this.#queries.set(query.queryHash, query)
@@ -232,6 +247,9 @@ export class QueryCache extends Subscribable<QueryCacheListener> {
    * }
    * ```
    */
+  // 用「实例同一性」而不是 hash 判断：如果该 hash 下已经换成别的实例，说明这次 remove 针对的是旧对象，
+  // 直接忽略，避免误删新实例。
+  // query.destroy() 会取消在途请求（Query.destroy → cancel({silent:true})），这是 remove 的隐藏副作用。
   remove(query: Query<any, any, any, any>): void {
     const queryInMap = this.#queries.get(query.queryHash)
 
@@ -251,6 +269,7 @@ export class QueryCache extends Subscribable<QueryCacheListener> {
    * queryCache.clear()
    * ```
    */
+  // 整批包在 notifyManager.batch 里：N 个 query 的 removed 事件会合并成一次通知周期。
   clear(): void {
     notifyManager.batch(() => {
       this.getAll().forEach((query) => {
@@ -321,6 +340,8 @@ export class QueryCache extends Subscribable<QueryCacheListener> {
    * const query = queryCache.find({ queryKey: ['posts'] })
    * ```
    */
+  // exact 默认 true：find({queryKey}) 是精确匹配；要前缀匹配必须显式 findAll 或传 exact:false。
+  // 这是「invalidateQueries 默认级联、find 默认不级联」差异的根源。
   find<TQueryFnData = unknown, TError = DefaultError, TData = TQueryFnData>(
     filters: WithRequired<QueryFilters, 'queryKey'>,
   ): Query<TQueryFnData, TError, TData> | undefined {
@@ -347,6 +368,7 @@ export class QueryCache extends Subscribable<QueryCacheListener> {
    * const queries = queryCache.findAll({ queryKey: ['posts'] })
    * ```
    */
+  // 无 filters 时直接返回全量：invoke invalidateQueries() 不传参数会命中所有 query，就是这个分支。
   findAll(filters: QueryFilters<any> = {}): Array<Query> {
     const queries = this.getAll()
     return Object.keys(filters).length > 0
@@ -359,6 +381,7 @@ export class QueryCache extends Subscribable<QueryCacheListener> {
    * @internal
    * @param event - The event passed to every listener.
    */
+  // 事件本身也包 batch：一次 Query.#dispatch 内的多个 observer 通知 + cache 通知会在同一批里派发。
   notify(event: QueryCacheNotifyEvent): void {
     notifyManager.batch(() => {
       this.listeners.forEach((listener) => {
@@ -371,6 +394,8 @@ export class QueryCache extends Subscribable<QueryCacheListener> {
    * Calls {@link Query#onFocus} on every cached query, in one batch.
    * @internal
    */
+  // 由 QueryClient.mount 注册的 focusManager 回调调用；逐个 Query 转发 onFocus。
+  // 每个 Query.onFocus 会挑一个「希望聚焦重取」的 observer 触发 refetch，并继续被暂停的 retryer。
   onFocus(): void {
     notifyManager.batch(() => {
       this.getAll().forEach((query) => {
@@ -383,6 +408,7 @@ export class QueryCache extends Subscribable<QueryCacheListener> {
    * Calls {@link Query#onOnline} on every cached query, in one batch.
    * @internal
    */
+  // 与 onFocus 对称，触发源是 onlineManager。
   onOnline(): void {
     notifyManager.batch(() => {
       this.getAll().forEach((query) => {

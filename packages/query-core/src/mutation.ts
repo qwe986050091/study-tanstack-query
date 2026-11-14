@@ -135,6 +135,14 @@ export type Action<TData, TError, TVariables, TOnMutateResult> =
  * const mutation = mutationCache.find({ mutationKey: ['addPost'] })
  * ```
  */
+// ═══ 中文注释导读 ═══
+// Mutation 是「一次写操作」的实例，与 Query 的关键区别：
+//   · 不做去重：每次 mutate() 都新建一个 Mutation（MutationObserver.mutate 里 build）；
+//   · 有生命周期回调链：onMutate → mutationFn → onSuccess/onError → onSettled；
+//   · 可以按 scope 串行：canRun 交给 MutationCache 判定（同一 scope 同时只跑一个）。
+// 状态机只有 4 个状态：idle → pending → success/error；isPaused 是 pending 的一个子标记。
+// 读 execute() 时重点看三件事：restored 分支（水合恢复）、回调顺序、错误回调的隔离处理。
+// ──────────────────────
 export class Mutation<
   TData = unknown,
   TError = DefaultError,
@@ -226,6 +234,8 @@ export class Mutation<
     })
   }
 
+  // 与 Query 的差别：pending 的 mutation 不能删（还在跑），只能重新排 GC 下一轮再看；
+  // 只有已结算（success/error）且没有 observer 时才真正从 cache 移除。
   protected override optionalRemove() {
     if (!this.#observers.length) {
       if (this.state.status === 'pending') {
@@ -257,6 +267,8 @@ export class Mutation<
    * await mutation?.continue()
    * ```
    */
+  // 恢复有三条路：有 retryer → 继续它；无 retryer 但状态仍是 pending（水合恢复）→ 用最后变量重跑；
+  // 已结算 → 直接 resolve（不能重新执行一次已经完成的写操作）。
   continue(): Promise<unknown> {
     return (
       this.#retryer?.continue() ??
@@ -298,6 +310,11 @@ export class Mutation<
    * const data = await mutation.execute(variables)
    * ```
    */
+  // 回调顺序是契约，不要随意调换：
+  //   cache.onMutate → options.onMutate → （context 变化则再 dispatch 一次 pending）→ retryer
+  //   → cache.onSuccess → options.onSuccess → cache.onSettled → options.onSettled → dispatch success
+  //   → finally: 清 retryer + runNext(同 scope 的下一个)。
+  // 失败路径同样是 cache → options，但四个回调各自 try/catch，保证「回调抛错不能盖掉原始错误」。
   async execute(variables: TVariables): Promise<TData> {
     const onContinue = () => {
       this.#dispatch({ type: 'continue' })
@@ -309,6 +326,8 @@ export class Mutation<
       mutationKey: this.options.mutationKey,
     } satisfies MutationFunctionContext
 
+    // canRun 是 scope 串行的唯一开关：交给 MutationCache 判断「同 scope 是否有更早的 pending」。
+    // retry 默认 0（与 query 的客户端默认 3 不同）：写操作默认不重试，避免重复提交。
     const retryer = (this.#retryer = createRetryer({
       fn: () => {
         if (!this.options.mutationFn) {
@@ -330,10 +349,14 @@ export class Mutation<
       canRun: () => this.#mutationCache.canRun(this),
     }))
 
+    // 水合恢复的判定：进入 execute 前状态已是 pending，说明这是从持久化/服务端恢复的「未完成 mutation」。
+    // isPaused 预先算好（retryer 此刻能否启动），随第一次 pending dispatch 一起写入 state。
     const restored = this.state.status === 'pending'
     const isPaused = !retryer.canStart()
 
     try {
+      // 恢复场景不再跑 onMutate：它的副作用（例如乐观更新）在原来的实例里已经执行过，
+      // 重跑会重复写入。这里只 dispatch continue 解除暂停，然后直接进入 retryer。
       if (restored) {
         // Dispatch continue action to unpause restored mutation
         onContinue()
@@ -347,6 +370,8 @@ export class Mutation<
             mutationFnContext,
           )
         }
+        // onMutate 的返回值就是 context，会传给后续所有回调；
+        // 只有 context 真的变化才再 dispatch 一次 pending（避免无谓通知）。
         const context = await this.options.onMutate?.(
           variables,
           mutationFnContext,
@@ -361,6 +386,8 @@ export class Mutation<
         }
       }
       // Unpause a mutation that became able to start while onMutate was running
+      // onMutate 可能是异步的，等待期间网络/scope 条件可能已满足：
+      // 这里补一次 continue，避免 mutation 卡在 paused 直到下一次外部事件。
       if (this.state.isPaused && retryer.canStart()) {
         onContinue()
       }
@@ -402,6 +429,8 @@ export class Mutation<
 
       this.#dispatch({ type: 'success', data })
       return data
+    // 注意顺序：先跑完所有 onError/onSettled（每个都吞掉自身异常），
+    // 最后才 dispatch('error') 并 rethrow —— 这样「用户回调里抛错」不会把 mutation 的最终状态改错。
     } catch (error) {
       try {
         // Notify cache callback
@@ -461,10 +490,14 @@ export class Mutation<
       if (this.#retryer === retryer) {
         this.#retryer = undefined
       }
+      // 无论成功失败都要唤醒同 scope 的下一个暂停 mutation，否则 scope 队列会永久卡住。
       this.#mutationCache.runNext(this)
     }
   }
 
+  // 与 Query 同构：reducer + 通知 observers + 通知 cache。
+  // 但 mutation 的 observers 用 onMutationUpdate(action)（要把 action 传给 per-call 回调），
+  // 且没有「结构化共享」这一步因为 mutation 结果不参与派生比较。
   #dispatch(action: Action<TData, TError, TVariables, TOnMutateResult>): void {
     const reducer = (
       state: MutationState<TData, TError, TVariables, TOnMutateResult>,
@@ -486,6 +519,8 @@ export class Mutation<
             ...state,
             isPaused: false,
           }
+        // 进入 pending 会清空上一轮结果（data/error/failureCount）：每次 mutate 都是一次全新事务。
+        // submittedAt 在每次 pending 时刷新，供 devtools 和超时判定使用。
         case 'pending':
           return {
             ...state,
@@ -509,6 +544,8 @@ export class Mutation<
             status: 'success',
             isPaused: false,
           }
+        // 失败时 data 置 undefined（写操作没有「半个成功」的语义），但 failureCount 自增。
+        // isPaused 置 false：结算后不再算暂停。
         case 'error':
           return {
             ...state,
@@ -540,6 +577,7 @@ export class Mutation<
  * Returns the initial state of a mutation: `'idle'`, with no data, error, or variables.
  * @returns The initial mutation state.
  */
+// 初始 idle 态：没有 variables 也没有 submittedAt（0）。
 export function getDefaultState<
   TData,
   TError,

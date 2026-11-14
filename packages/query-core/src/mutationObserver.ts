@@ -34,6 +34,13 @@ type MutationObserverListener<TData, TError, TVariables, TOnMutateResult> = (
  * })
  * ```
  */
+// ═══ 中文注释导读 ═══
+// MutationObserver 是 useMutation 的内核，与 QueryObserver 的关键差异：
+//   · 它观察的是「最近一次 mutate 创建的 Mutation」，而不是长期存在的缓存条目；
+//   · 每次 mutate() 都会：摘掉旧 mutation → build 新 mutation → 挂上 → execute；
+//   · reset() 只是「断开观察 + 回到 idle」，不会取消在途 mutation。
+// 因此「mutation 状态」在语义上是「这个 hook 实例最近一次写操作的状态」，不是全局共享的。
+// ──────────────────────
 export class MutationObserver<
   TData = unknown,
   TError = DefaultError,
@@ -97,6 +104,9 @@ export class MutationObserver<
    * })
    * ```
    */
+  // 两种特殊处理：
+  //   1) mutationKey 变了且两边都有值 → reset()（不同 key 视为不同业务，不能沿用旧结果）；
+  //   2) 当前 mutation 仍 pending → 把新 options 覆盖到它身上，让在途操作也用最新回调。
   setOptions(
     options: MutationObserverOptions<
       TData,
@@ -185,6 +195,8 @@ export class MutationObserver<
    * observer.reset()
    * ```
    */
+  // 注释里的这句是重点：没法「找回」旧 mutation，因为下次 mutate 一定新建一个。
+  // 所以 reset 之后 #currentMutation = undefined，结果回到默认 idle 态。
   reset(): void {
     // reset needs to remove the observer from the mutation because there is no way to "get it back"
     // another mutate call will yield a new mutation!
@@ -214,6 +226,9 @@ export class MutationObserver<
    * )
    * ```
    */
+  // 每次调用都是「换一个 mutation 观察」：先摘旧、再 build 新的、再挂上、最后 execute。
+  // per-call options 暂存在 #mutateOptions，由 #notify 在结算时调用（与 observer options 上的回调并存）。
+  // 注意返回的是 execute 的 promise：所以 await mutate() 能拿到数据或错误。
   mutate(
     variables: TVariables,
     options?: MutateOptions<TData, TError, TVariables, TOnMutateResult>,
@@ -247,6 +262,8 @@ export class MutationObserver<
     } as MutationObserverResult<TData, TError, TVariables, TOnMutateResult>
   }
 
+  // 两个阶段：先跑 per-call 回调（onSuccess/onError/onSettled），再通知订阅者（触发重渲染）。
+  // 每个回调都独立 try/catch：一个回调抛错不能阻止其余回调与监听者。
   #notify(action?: Action<TData, TError, TVariables, TOnMutateResult>): void {
     notifyManager.batch(() => {
       // First trigger the mutate callbacks
@@ -254,6 +271,8 @@ export class MutationObserver<
       // may call mutate() again, which overwrites this.#mutateOptions in place.
       // Without the snapshot, onSettled would fire with the *next* mutation's
       // options but the *current* mutation's data/variables.
+      // 为什么要先快照：回调里可能再次调用 mutate()，那会把 #mutateOptions 覆盖成下一次的；
+      // 不快照的话，本次 onSettled 会拿到「下一次的 options + 本次的 data」，语义错位。
       const mutateOptions = this.#mutateOptions
       if (mutateOptions && this.hasListeners()) {
         const variables = this.#currentResult.variables!

@@ -18,6 +18,10 @@ import type { QueryErrorResetBoundaryValue } from './QueryErrorResetBoundary'
  * @param errorResetBoundary - The value of the nearest `QueryErrorResetBoundary`.
  * @param query - The query, used to evaluate a `throwOnError` function against its error.
  */
+// 关键机制：错误抛出后，组件卸载再挂载时默认 retryOnMount 会再取一次，
+// 结果又是错误 → 再次抛给边界 → 用户看到错误页闪烁。
+// 所以在「会抛错（suspense 或 throwOnError）」且「边界还没被重置」时关掉 retryOnMount，
+// 直到用户主动 reset（ErrorBoundary 的 reset 按钮）。
 export const ensurePreventErrorBoundaryRetry = <
   TQueryFnData,
   TError,
@@ -57,6 +61,8 @@ export const ensurePreventErrorBoundaryRetry = <
  * thrown to the boundary again.
  * @param errorResetBoundary - The value of the nearest `QueryErrorResetBoundary`.
  */
+// 挂载后立刻清掉 reset 标记：保证「这次挂载之后」再发生的错误仍能正常抛给边界。
+// 与上面的 prevent 配合，形成「只抑制跨挂载的重复重试，不抑制本次渲染内的错误」。
 export const useClearResetErrorBoundary = (
   errorResetBoundary: QueryErrorResetBoundaryValue,
 ) => {
@@ -73,6 +79,9 @@ export const useClearResetErrorBoundary = (
  * `query`, and the `suspense` option.
  * @returns `true` if the error should be thrown.
  */
+// 四个条件全真才抛：isError、边界未被重置、当前不在 fetching、query 存在，
+// 且（suspense 且无数据）或 throwOnError 判定为真。
+// !result.isFetching 是为了「重试中不抛」：重试成功后这次错误就自然消失了。
 export const getHasError = <
   TData,
   TError,

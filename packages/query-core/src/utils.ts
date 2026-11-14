@@ -1,3 +1,11 @@
+// ═══ 中文注释导读 ═══
+// utils.ts 是 query-core 的公共零件箱，本文件里与主链路关系最紧的是四个函数，建议按此顺序读：
+//   hashKey / hashQueryKeyByOptions —— 决定 queryHash，进而决定「什么算同一个查询」（请求去重的基础）；
+//   partialMatchKey —— queryKey 前缀匹配，invalidateQueries({ queryKey: ['posts'] }) 能级联的基础；
+//   replaceEqualDeep / replaceData —— 结构共享，决定重取后 data 的引用是否变化；
+//   addConsumeAwareSignal —— 懒读取 AbortSignal，决定「没人读 signal 时查询不被取消」。
+// 其余（noop/sleep/isPlainObject…）都是被上面这些和 retryer/observer 直接调用的小工具。
+// ──────────────────────
 import { timeoutManager } from './timeoutManager'
 import type {
   DefaultError,
@@ -143,6 +151,8 @@ export function functionalUpdate<TInput, TOutput>(
  * @param value - The value to check.
  * @returns `true` if `value` is a number that is `>= 0` and not `Infinity`.
  */
+// 排除 Infinity 是刻意的：`gcTime: Infinity` / `staleTime: Infinity` 表示「永不」，
+// 不能真的去排一个 Infinity 定时器（浏览器会立刻当成 1ms 或直接忽略）。
 export function isValidTimeout(value: unknown): value is number {
   return typeof value === 'number' && value >= 0 && value !== Infinity
 }
@@ -154,6 +164,10 @@ export function isValidTimeout(value: unknown): value is number {
  * `0`.
  * @returns The remaining time in milliseconds, or `0` if the data is already stale.
  */
+// 返回「还剩多久变 stale」，已过期返回 0。
+// 两个用途：Query.isStaleByTime 用 `!timeUntilStale(...)` 判断是否过期；
+//           QueryObserver 用它算 stale 定时器的延迟。
+// staleTime 传 0/undefined 时等价于「立即过期」，这是默认值。
 export function timeUntilStale(updatedAt: number, staleTime?: number): number {
   return Math.max(updatedAt + (staleTime || 0) - Date.now(), 0)
 }
@@ -165,6 +179,8 @@ export function timeUntilStale(updatedAt: number, staleTime?: number): number {
  * @param query - The query passed to `value` if it is a function.
  * @returns The resolved value, or `undefined` if `value` is `undefined`.
  */
+// v5.107 起不少 option 支持「值或函数」，staleTime / enabled / refetchInterval 等都可能是函数。
+// 因此任何读这些 option 的地方都必须过 resolveQueryValue，直接读会拿到函数本身。
 export function resolveQueryValue<
   TValue,
   TQueryFnData = unknown,
@@ -202,6 +218,10 @@ export function resolveQueryValue<
  *   .filter((query) => matchQuery({ queryKey: ['posts'] }, query))
  * ```
  */
+// 过滤器求值是「与」关系：只要某一项不匹配就 false，未提供的项直接跳过。
+// 注意 exact 分支比较的是 queryHash（而不是数组逐项相等），所以自定义 queryKeyHashFn 时语义一致。
+// 各字段的判定顺序：queryKey → type(active/inactive) → stale → fetchStatus → predicate。
+// predicate 放最后，是留给调用方的最后一道自定义筛选。
 export function matchQuery(
   filters: QueryFilters,
   query: Query<any, any, any, any>,
@@ -320,6 +340,10 @@ export function hashQueryKeyByOptions<TQueryKey extends QueryKey = QueryKey>(
  * hashKey(['todos', { page: 1, filter: 'done' }]) // === '["todos",{"filter":"done","page":1}]'
  * ```
  */
+// 默认哈希 = JSON.stringify + 对象键排序。三点必须知道：
+//   1) 对象内部键顺序不影响 hash，但数组顺序影响（['a','b'] ≠ ['b','a']）；
+//   2) undefined / 函数 / Symbol 会被 JSON 丢弃或转成 null，因此 queryKey 里放过这些东西会出现意外合并；
+//   3) 这个字符串就是 QueryCache 的 Map 键（queryHash），相等即「同一个查询」——请求去重就发生在这里。
 export function hashKey(queryKey: QueryKey | MutationKey): string {
   return JSON.stringify(queryKey, (_, val) =>
     isPlainObject(val)
@@ -340,6 +364,11 @@ export function hashKey(queryKey: QueryKey | MutationKey): string {
  * @returns `true` if every array element or object property in `b` matches the one at the same
  * position in `a`.
  */
+// a 是 query 自己的 key，b 是过滤器里给的「前缀」。
+// 数组：b 必须是 a 的前缀（b 更长直接 false），逐位递归；
+// 对象：b 的每个键都必须在 a 里匹配（键数可以少于 a）；
+// 其余情况走 `a === b` 的严格相等。
+// 因此 ['posts', {page:1}] 能被 ['posts'] 命中，但不会被 ['post'] 命中。
 export function partialMatchKey(a: QueryKey, b: QueryKey): boolean
 export function partialMatchKey(a: any, b: any): boolean {
   if (a === b) {
@@ -385,6 +414,10 @@ const hasOwn = Object.prototype.hasOwnProperty
  * @returns `a` if `b` is deeply equal to it, otherwise `b` with its deeply equal parts replaced by
  * those of `a`.
  */
+// 结构共享的核心：返回值要么是 a（b 与 a 深度相等），要么是 b 的浅拷贝（可复用的子节点沿用 a 的引用）。
+// 为什么重要：重取后数据内容没变时返回 a，于是 Query.setState 的 data 引用不变，
+// QueryObserver.createResult 产出的 result 浅比较相等，updateResult 就不会通知监听者 —— 组件不重渲染。
+// depth > 500 直接放弃共享，防止超深对象爆栈/耗时。
 export function replaceEqualDeep<T>(a: unknown, b: T, depth?: number): T
 export function replaceEqualDeep(a: any, b: any, depth = 0): any {
   if (a === b) {
@@ -397,6 +430,8 @@ export function replaceEqualDeep(a: any, b: any, depth = 0): any {
 
   if (!array && !(isPlainObject(a) && isPlainObject(b))) return b
 
+  // equalItems 统计「b 的这一项最终复用了 a 的引用」的次数。
+  // 只有 bSize === aSize 且每一项都相等时才整体返回 a；否则返回 copy。
   const aItems = array ? a : Object.keys(a)
   const aSize = aItems.length
   const bItems = array ? b : Object.keys(b)
@@ -539,6 +574,10 @@ export function sleep(timeout: number): Promise<void> {
  * @throws {Error} The error from the default structural sharing, e.g. when the data is not JSON serializable.
  * Outside production, it is also logged to the console.
  */
+// Query.setData 与 QueryObserver.createResult（placeholderData / select 之后）都走这里。
+// structuralSharing 三种取值：函数 = 用户自定义；false = 完全不共享；其余 = replaceEqualDeep。
+// 注意 catch 只在开发环境：replaceEqualDeep 本身不会抛，真正会抛的是之后用户代码对 data 的处理，
+// 这里 catch 后 rethrow 是为了把「数据不可 JSON 序列化」这个根因讲清楚。
 export function replaceData<
   TData,
   TOptions extends QueryOptions<any, any, any, any>,
@@ -579,6 +618,8 @@ export function replaceData<
  * })
  * ```
  */
+// 只作为 placeholderData 的占位实现：把上一个 queryKey 的 data 原样返回，
+// 具体「上一个」由 QueryObserver.createResult 传入（#lastQueryWithDefinedData）。
 export function keepPreviousData<T>(
   previousData: T | undefined,
 ): T | undefined {
@@ -593,6 +634,7 @@ export function keepPreviousData<T>(
  * @param max - The maximum number of items to keep. `0` (the default) means no limit.
  * @returns A new array with `item` added.
  */
+// max 用于无限查询的 maxPages：超过就从头裁掉，保证 pages / pageParams 两个数组同步裁剪。
 export function addToEnd<T>(items: Array<T>, item: T, max = 0): Array<T> {
   const newItems = [...items, item]
   return max && newItems.length > max ? newItems.slice(-max) : newItems
@@ -623,6 +665,8 @@ export function addToStart<T>(items: Array<T>, item: T, max = 0): Array<T> {
  * })
  * ```
  */
+// 用 Symbol 而不是特殊字符串/函数，避免与用户合法返回值撞车；
+// 它同时被 QueryClient.defaultQueryOptions 用来强制 enabled = false（见 queryClient.ts）。
 export const skipToken = Symbol()
 /**
  * The type of the {@link skipToken} sentinel value.
@@ -637,6 +681,11 @@ export type SkipToken = typeof skipToken
  * @param fetchOptions - The fetch options, which may carry an `initialPromise`.
  * @returns The function to call for the fetch.
  */
+// 这个函数处理三条边界，顺序不能换：
+//   1) queryFn === skipToken：开发环境报错提示「配置错了」，然后走 3) 的 Missing queryFn 分支；
+//   2) 没有 queryFn 但有 initialPromise（hydration 恢复的在途 promise）：重试时直接复用该 promise，
+//      因为此时确实没有可重试的函数；
+//   3) 两者都没有：返回一个必然 reject 的函数，让错误走正常的 error 状态而不是抛在调用栈上。
 export function ensureQueryFn<
   TQueryFnData = unknown,
   TQueryKey extends QueryKey = QueryKey,
@@ -720,6 +769,10 @@ export type FetchSignalContext = {
  * @param internalSignal - The fetch signal to forward without consuming the getter.
  * @returns The same object, with the `signal` property added.
  */
+// 「懒 signal」是 v5 取消语义的关键：只有在 queryFn 真正读了 context.signal，
+// 才算这个查询支持取消（Query.#abortSignalConsumed = true）。
+// 于是 removeObserver 时：读过 signal → 取消请求；没读过 → 只 cancelRetry，让请求继续跑完并写缓存。
+// internalSignal 用于把 signal 透传给无限查询内部（内部读取不应被算作消费）。
 export function addConsumeAwareSignal<T extends object>(
   object: T,
   getSignal: () => AbortSignal,

@@ -1,3 +1,9 @@
+// ═══ 中文注释导读 ═══
+// 这是 query-core 的公共 API 表面：只有 re-export，没有运行时逻辑。
+// 读核心链路时不需要看本文件；它的价值是「反向查名字」——
+// 想知道某个导出是谁实现的，从这里跳到对应模块即可。
+// 读链路请从 ./query 的 QueryState 开始（见 docs/annotation/READING-GUIDE.md 第 2 节）。
+// ──────────────────────
 /* istanbul ignore file */
 
 export { focusManager } from './focusManager'

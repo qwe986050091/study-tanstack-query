@@ -75,6 +75,14 @@ interface MutationDefaults {
  * await queryClient.query({ queryKey: ['posts'], queryFn: fetchPosts })
  * ```
  */
+// ═══ 中文注释导读 ═══
+// QueryClient 是门面（facade）：自己不存数据，只持有两个 cache 与一份默认配置。
+// 三条读法：
+//   1) 命令式 API（get/setQueryData、invalidate、refetch、remove、reset、cancel）—— 全部先 findAll 再逐个转发给 Query；
+//   2) 取数 API（query/fetchQuery/prefetchQuery/infiniteQuery）—— 唯一区别是「是否尊重 staleTime」「错误怎么处理」；
+//   3) 默认值装配（defaultQueryOptions）—— 所有 observer 与命令式调用都过这里，是理解「配置从哪来」的终点。
+// 关键不变量：invalidate 只打标记，refetch 才取数；两者在 invalidateQueries 里被串起来（refetchType 控制）。
+// ──────────────────────
 export class QueryClient {
   #queryCache: QueryCache
   #mutationCache: MutationCache
@@ -85,6 +93,8 @@ export class QueryClient {
   #unsubscribeFocus?: () => void
   #unsubscribeOnline?: () => void
 
+  // 允许注入现成的 cache：SSR 每请求一个 client 时通常新建；测试与广播插件会替换 cache 实现。
+  // #mountCount 初始 0：未 mount 时不会订阅 focus/online，所以「没人调用 mount 就没有自动重取」。
   constructor(config: QueryClientConfig = {}) {
     this.#queryCache = config.queryCache || new QueryCache()
     this.#mutationCache = config.mutationCache || new MutationCache()
@@ -100,6 +110,9 @@ export class QueryClient {
    * mount count, so nested or multiple providers sharing the same `QueryClient` don't tear down
    * the shared listeners until the last one unmounts.
    */
+  // 引用计数：多个 Provider 共用一个 client 时，只有第一个 mount 真正注册监听，最后一个 unmount 才拆除。
+  // 两个订阅回调的顺序值得注意：先 await resumePausedMutations()，再 queryCache.onFocus/onOnline()。
+  // 即「恢复离线的 mutation」优先于「重取查询」，避免 mutation 的结果被同时进行的 refetch 覆盖。
   mount(): void {
     this.#mountCount++
     if (this.#mountCount !== 1) return
@@ -148,6 +161,7 @@ export class QueryClient {
    * }
    * ```
    */
+  // 同步统计，不订阅。组件里想响应式地拿它请用 useIsFetching（内部是 QueryObserver + 订阅 cache 事件）。
   isFetching(filters?: Omit<QueryFilters, 'fetchStatus'>): number {
     return this.#queryCache.findAll({ ...filters, fetchStatus: 'fetching' })
       .length
@@ -185,6 +199,8 @@ export class QueryClient {
    * @returns The cached data for the query, or `undefined` if no query with this key has been observed yet.
    * @see {@link QueryClient#getQueriesData}
    */
+  // 命中靠 queryHash 直接从 Map 取，不遍历、不建 query：查询不存在时返回 undefined，不会顺手创建一个。
+  // 注意它**不是响应式**的，组件里用会在数据变化后拿到旧值 —— 这是注释里反复强调的一点。
   getQueryData<
     TQueryFnData = unknown,
     TTaggedQueryKey extends QueryKey = QueryKey,
@@ -283,6 +299,9 @@ export class QueryClient {
    * queryClient.setQueryData(['posts'], (oldPosts) => [...oldPosts, newPost])
    * ```
    */
+  // 三件事：算 hash → 取旧 data 给 updater → 若结果非 undefined 则 build（必要时新建 query）并 setData(manual:true)。
+  // manual 标记会影响 Query 的 revertState 与 fetchStatus（见 query.ts 的 success 分支）。
+  // updater 返回 undefined 表示「放弃写入」：既不新建 query，也不通知 —— 这是乐观更新里常用的提前退出。
   setQueryData<
     TQueryFnData = unknown,
     TTaggedQueryKey extends QueryKey = QueryKey,
@@ -336,6 +355,8 @@ export class QueryClient {
    * )
    * ```
    */
+  // 只更新「已存在且匹配」的 query（findAll 的结果），不会为匹配 key 新建缓存条目。
+  // 整体包 batch：N 个 query 的状态变更合并为一次通知周期。
   setQueriesData<
     TQueryFnData,
     TQueryFilters extends QueryFilters<any> = QueryFilters,
@@ -395,6 +416,8 @@ export class QueryClient {
    * queryClient.removeQueries({ queryKey: ['posts'], exact: true })
    * ```
    */
+  // 与 invalidate 的区别：remove 是「删掉并销毁」（destroy → 取消在途请求），invalidate 是「留着但标脏」。
+  // 不传 filters 等于清空整个 query 缓存（等价于 queryCache.clear 的 query 部分）。
   removeQueries<TTaggedQueryKey extends QueryKey = QueryKey>(
     filters?: QueryFilters<TTaggedQueryKey>,
   ): void {
@@ -420,6 +443,9 @@ export class QueryClient {
    * await queryClient.resetQueries({ queryKey: ['posts'], exact: true })
    * ```
    */
+  // 两步：先把匹配的 query 全部 reset（回到构造时状态，含 initialData），
+  // 再只对其中「仍 active」的做 refetch。predicate 用 Set 保证只重取一开始匹配到的那批。
+  // 返回的 promise 是 refetch 的 promise，因此 resetQueries 语义上会等待重新取数完成。
   resetQueries<TTaggedQueryKey extends QueryKey = QueryKey>(
     filters?: QueryFilters<TTaggedQueryKey>,
     options?: ResetOptions,
@@ -459,6 +485,9 @@ export class QueryClient {
    * await queryClient.cancelQueries({ queryKey: ['posts'], exact: true })
    * ```
    */
+  // revert 默认 true：取消后状态回滚到取数之前 —— 这几乎是为了配合乐观更新，
+  // 否则「取消一个会覆盖乐观值的 refetch」反而会把乐观值留着但状态错乱。
+  // 返回值永远 resolve（Promise.all(...).then(noop).catch(noop)）：单个取消失败不阻塞调用方。
   cancelQueries<TTaggedQueryKey extends QueryKey = QueryKey>(
     filters?: QueryFilters<TTaggedQueryKey>,
     cancelOptions: CancelOptions = {},
@@ -492,6 +521,12 @@ export class QueryClient {
    * await queryClient.invalidateQueries({ queryKey: ['posts'], refetchType: 'active' })
    * ```
    */
+  // 这是「失效级联」的核心：
+  //   1) findAll(filters)：不传 queryKey 就是全部；传 ['posts'] 默认前缀匹配（exact 未设）。
+  //   2) query.invalidate()：只置 isInvalidated，不动数据。
+  //   3) 按 refetchType（缺省回落到 filters.type，再缺省 'active'）调 refetchQueries。
+  // 所以「invalidateQueries 会重取」成立的前提是 refetchType !== 'none'；
+  // 只想标脏、稍后自己取，就传 refetchType: 'none'。
   invalidateQueries<TTaggedQueryKey extends QueryKey = QueryKey>(
     filters?: InvalidateQueryFilters<TTaggedQueryKey>,
     options: InvalidateOptions = {},
@@ -501,6 +536,7 @@ export class QueryClient {
         query.invalidate()
       })
 
+      // 提前返回，不进入 refetch 分支；注意外层 batch 仍在，标记变更会一并派发。
       if (filters?.refetchType === 'none') {
         return Promise.resolve()
       }
@@ -537,6 +573,10 @@ export class QueryClient {
    * await queryClient.refetchQueries({ queryKey: ['posts'], type: 'active' })
    * ```
    */
+  // 「强制重取」：不看 stale、不看 refetchOn*，但会跳过两类 query：
+  //   isDisabled（enabled:false / skipToken / 从未 fetch）与 isStatic（有 observer 且 staleTime:'static'）。
+  // cancelRefetch 默认 true：打断已有请求。
+  // 暂停中的 query 返回 Promise.resolve()：否则调用方会 await 到一个「等网络恢复」的 promise，可能永远不返回。
   refetchQueries<TTaggedQueryKey extends QueryKey = QueryKey>(
     filters?: RefetchQueryFilters<TTaggedQueryKey>,
     options: RefetchOptions = {},
@@ -548,6 +588,7 @@ export class QueryClient {
     const promises = notifyManager.batch(() =>
       this.#queryCache
         .findAll(filters)
+        // 这两条过滤就是「refetchQueries 不会救活被禁用的查询」的实现。
         .filter((query) => !query.isDisabled() && !query.isStatic())
         .map((query) => {
           let promise = query.fetch(undefined, fetchOptions)
@@ -596,6 +637,10 @@ export class QueryClient {
    * }
    * ```
    */
+  // 新一代统一取数 API（替代 fetchQuery / ensureQueryData）：
+  // 语义 = 「给我数据，缓存里新鲜就直接给，否则取一次」。
+  // 关键差异：这里的 retry 默认 false（下方显式赋值），因为命令式调用没有组件去承接错误重试。
+  // select 在「命中缓存」与「新取数」两条路径都会执行，保证返回值形状一致。
   async query<
     TQueryFnData,
     TError = DefaultError,
@@ -616,12 +661,15 @@ export class QueryClient {
     const defaultedOptions = this.defaultQueryOptions(options)
 
     // https://github.com/tannerlinsley/react-query/issues/652
+    // 只填空值：调用方显式传 retry 时尊重之。
     if (defaultedOptions.retry === undefined) {
       defaultedOptions.retry = false
     }
 
     const query = this.#queryCache.build(this, defaultedOptions)
 
+    // 唯一的分叉点：stale 才 fetch，否则直接返回缓存 data。
+    // 注意这里用的是「本次 options 的 staleTime」，不是 query 上已有的配置。
     const isStale = query.isStaleByTime(
       resolveQueryValue(defaultedOptions.staleTime, query),
     )
@@ -687,6 +735,8 @@ export class QueryClient {
    * @returns A promise that resolves once the fetch settles. It never rejects.
    * @deprecated Use queryClient.query(options) instead. You can swallow errors with `.catch(noop)`. This method will be removed in the next major version.
    */
+  // 预取 = fetchQuery + 吞掉结果与错误。返回 Promise<void>，永不 reject。
+  // 这是「后台预热缓存」的标准做法：数据进了缓存，后续挂载直接命中。
   prefetchQuery<
     TQueryFnData = unknown,
     TError = DefaultError,
@@ -723,6 +773,9 @@ export class QueryClient {
    * }
    * ```
    */
+  // 无限查询与普通查询唯一的结构性差异就在这一行 `options._type = 'infinite'`：
+  // 它最终写进 Query.#queryType，Query.fetch 里据此选用 infiniteQueryBehavior 作为 behavior。
+  // 其余（去重、失效、GC）完全复用同一套机制。
   infiniteQuery<
     TQueryFnData,
     TError = DefaultError,
@@ -843,6 +896,8 @@ export class QueryClient {
    * await queryClient.resumePausedMutations()
    * ```
    */
+  // 先判 online 再委派：离线时直接 resolve，避免把「等网络」的 promise 暴露给调用方。
+  // 实际的恢复逻辑在 MutationCache.resumePausedMutations（按 scope 逐个 continue）。
   resumePausedMutations(): Promise<unknown> {
     if (onlineManager.isOnline()) {
       return this.#mutationCache.resumePausedMutations()
@@ -935,6 +990,10 @@ export class QueryClient {
    * await queryClient.query({ queryKey: ['posts'] })
    * ```
    */
+  // 按 key 注册默认值，key 本身做 hash 存进 Map。
+  // 匹配用的是 partialMatchKey（前缀匹配），所以 ['posts'] 的默认值会作用于 ['posts', 1]。
+  // 注册顺序有意义：getQueryDefaults 按 Map 插入顺序 Object.assign，后注册的覆盖先注册的。
+  // 因此「越具体的 key 越晚注册」才能生效 —— 注释里也写了这一点。
   setQueryDefaults<
     TQueryFnData = unknown,
     TError = DefaultError,
@@ -967,6 +1026,8 @@ export class QueryClient {
    * const defaultOptions = queryClient.getQueryDefaults(['posts'])
    * ```
    */
+  // 遍历所有注册项，前缀匹配的全部合并。没有匹配时返回空对象（不是 undefined），
+  // 于是调用方的展开合并写法可以无条件使用。
   getQueryDefaults(
     queryKey: QueryKey,
   ): OmitKeyof<QueryObserverOptions<any, any, any, any, any>, 'queryKey'> {
@@ -1055,6 +1116,14 @@ export class QueryClient {
    * @returns The defaulted options, with `queryHash` and dependent defaults (e.g.
    * `refetchOnReconnect`) filled in.
    */
+  // 所有 query 选项的最终装配点，合并优先级从低到高：
+  //   client.defaultOptions.queries → setQueryDefaults(queryKey) → 调用方 options。
+  // 之后补齐几组「派生默认值」，每一组都对应一条行为，改动时要知道影响面：
+  //   · queryHash：没有就按 queryKey 算（去重键）；
+  //   · refetchOnReconnect 缺省 = networkMode !== 'always'（always 模式本来就不在乎网络）；
+  //   · throwOnError 缺省 = !!suspense（suspense 语义要求错误抛给边界）；
+  //   · 有 persister 且未指定 networkMode → 'offlineFirst'；
+  //   · queryFn === skipToken → enabled = false（类型层已挡住，这里是运行时兜底）。
   defaultQueryOptions<
     TQueryFnData = unknown,
     TError = DefaultError,
@@ -1086,6 +1155,8 @@ export class QueryClient {
     TQueryData,
     TQueryKey
   > {
+    // _defaulted 是幂等标记：observer.setOptions、useBaseQuery 每渲染都会调用本函数，
+    // 没有这个标记会反复展开合并、反复算 hash。
     if (options._defaulted) {
       return options as DefaultedQueryObserverOptions<
         TQueryFnData,
@@ -1111,6 +1182,7 @@ export class QueryClient {
     }
 
     // dependent default values
+    // 派生默认值只有「未显式设置」时才写，不会覆盖用户的 false。
     if (defaultedOptions.refetchOnReconnect === undefined) {
       defaultedOptions.refetchOnReconnect =
         defaultedOptions.networkMode !== 'always'
@@ -1123,6 +1195,8 @@ export class QueryClient {
       defaultedOptions.networkMode = 'offlineFirst'
     }
 
+    // skipToken 的运行时语义：无视用户传的 enabled，一律禁用。
+    // 这样 enabled 与 skipToken 同时出现时行为确定（禁用），而不是取决于书写顺序。
     if (defaultedOptions.queryFn === skipToken) {
       defaultedOptions.enabled = false
     }
@@ -1144,6 +1218,8 @@ export class QueryClient {
    * @param options - The mutation options passed by the caller.
    * @returns The defaulted options.
    */
+  // mutation 版装配：client.defaultOptions.mutations → setMutationDefaults(mutationKey) → options。
+  // 注意只有传了 mutationKey 才查注册默认值（query 版是按 queryKey 必查的）。
   defaultMutationOptions<T extends MutationOptions<any, any, any, any>>(
     options?: T,
   ): T {
@@ -1169,6 +1245,7 @@ export class QueryClient {
    * queryClient.clear()
    * ```
    */
+  // 只清两个 cache，不动 defaultOptions 与 mount 状态。
   clear(): void {
     this.#queryCache.clear()
     this.#mutationCache.clear()

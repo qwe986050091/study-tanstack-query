@@ -12,6 +12,14 @@ type SetupFn = (setOnline: Listener) => (() => void) | undefined
  * listens to the `online` and `offline` events on the `window` object to
  * detect changes.
  */
+// ═══ 中文注释导读 ═══
+// 与 FocusManager 同构的全局单例，维护「是否在线」，是 networkMode 与断网暂停/恢复的输入。
+// 三个使用方（读的时候按这三条线去对照）：
+//   1) retryer.canFetch / canContinue → 决定 fetch 是 'fetching' 还是 'paused'；
+//   2) QueryClient.mount 的 online 订阅 → 恢复暂停的 mutation + queryCache.onOnline() 触发重取；
+//   3) QueryClient.resumePausedMutations 的前置判断。
+// 注意 #online 初始为 true：未收到任何事件前一律当在线，避免首屏不发请求。
+// ──────────────────────
 export class OnlineManager extends Subscribable<Listener> {
   #online = true
   #cleanup?: () => void
@@ -93,6 +101,7 @@ export class OnlineManager extends Subscribable<Listener> {
    * onlineManager.setOnline(false)
    * ```
    */
+  // 同样只在值变化时广播；浏览器 online/offline 事件可能重复触发。
   setOnline(online: boolean): void {
     const changed = this.#online !== online
 
@@ -108,6 +117,7 @@ export class OnlineManager extends Subscribable<Listener> {
    * `isOnline` can be used to get the current online state.
    * @returns `true` if online.
    */
+  // 纯内存标记，不主动探测网络；真正的探测交给 navigator.onLine 驱动事件。
   isOnline(): boolean {
     return this.#online
   }

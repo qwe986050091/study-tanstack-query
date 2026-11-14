@@ -23,6 +23,8 @@ type TransformerFn = (data: any) => any
  * @returns An object with the resolved `data`, or `undefined` if the promise hasn't resolved
  * synchronously (or resolved with `undefined`).
  */
+// 有些 thenable 在执行 then 时就会同步 resolve（React Server Components 的预取 promise 就是）。
+// 用「then 回调是否在返回前已被调用」来判断能否同步拿到数据，避免无谓地走异步恢复分支。
 function tryResolveSync(promise: PromiseLike<unknown>) {
   let data: unknown
 
@@ -136,6 +138,10 @@ function dehydrateMutation(mutation: Mutation): DehydratedMutation {
  * error is kept as-is instead of being redacted.
  * @returns The transformed promise, or `undefined` if the query has no in-flight promise.
  */
+// 两条 promise 的改写：resolve 时过 serializeData（与 state.data 保持一致），
+// reject 时默认换成 `Error('redacted')` —— 避免把服务端的错误细节（可能含内部信息）带到客户端。
+// 末尾 catch(noop) 是必须的：这个 promise 要在客户端被 await，
+// 但服务端渲染期间没人消费它，不兜底会触发 unhandledRejection。
 function dehydratePromise(
   query: Query,
   serializeData?: TransformerFn,
@@ -175,6 +181,9 @@ function dehydratePromise(
  * error is kept as-is instead of being redacted.
  * @returns The dehydrated query.
  */
+// 单个 query 的快照：state（含 data）+ key + hash + 时间戳 + meta + queryType。
+// 只有 status 仍是 pending 时才附带 promise —— success/error 没有在途请求可接。
+// dehydratedAt 是后面「谁的数据更新」比较的基准，必须与 state.dataUpdatedAt 区分开。
 export function dehydrateQuery(
   query: Query,
   serializeData?: TransformerFn,
@@ -206,6 +215,7 @@ export function dehydrateQuery(
  * @param mutation - The mutation to check.
  * @returns `true` if the mutation is paused.
  */
+// 只搬暂停中的 mutation：在线时已经结算的写操作没有「待重放」的价值。
 export function defaultShouldDehydrateMutation(mutation: Mutation) {
   return mutation.state.isPaused
 }
@@ -216,6 +226,7 @@ export function defaultShouldDehydrateMutation(mutation: Mutation) {
  * @param query - The query to check.
  * @returns `true` if the query's status is `'success'`.
  */
+// 只搬 success：pending 会额外搬 promise（有成本），error 状态搬过去通常也无意义。
 export function defaultShouldDehydrateQuery(query: Query) {
   return query.state.status === 'success'
 }
@@ -242,6 +253,14 @@ export function defaultShouldDehydrateQuery(query: Query) {
  * const dehydratedState = dehydrate(queryClient)
  * ```
  */
+// ═══ 中文注释导读 ═══
+// hydration 是 SSR / 持久化的搬运层：dehydrate（服务端）→ 可序列化快照 → hydrate（客户端）→ 写回缓存。
+// 三个默认值决定了「默认搬什么」，读的时候先记住：
+//   · 默认只搬 success 的 query（失败的、pending 的默认不搬，可通过 shouldDehydrateQuery 改）；
+//   · 默认只搬 isPaused 的 mutation（离线期间的写操作要带到客户端继续）；
+//   · pending 的 query 会把「在途 promise」也搬过去，客户端可以接着等而不是重发。
+// 关键约束：只恢复 state，不恢复 queryFn/staleTime 等配置，客户端必须用相同 queryKey 再声明一次。
+// ──────────────────────
 export function dehydrate(
   client: QueryClient,
   options: DehydrateOptions = {},
@@ -303,6 +322,10 @@ export function dehydrate(
  * hydrate(queryClient, dehydratedState)
  * ```
  */
+// 恢复分两条支路，顺序不能反：先恢复 mutation（可能触发写操作），再恢复 query。
+// query 的恢复逻辑是「有则比新旧、无则新建」，比较基准是 dataUpdatedAt 与 dehydratedAt：
+//   · 已有 query 且快照时间更旧 → 直接丢弃快照，不覆盖客户端已经更新鲜的数据；
+//   · 新建 query 时强制 fetchStatus='idle'，否则会以 'fetching' 卡住（没人替它收尾）。
 export function hydrate(
   client: QueryClient,
   dehydratedState: Partial<DehydratedState>,
@@ -336,6 +359,7 @@ export function hydrate(
       dehydratedAt,
       queryType,
     }) => {
+      // 能同步拿到数据时优先用 promise 的结果（比 state.data 新），然后再过一次 deserializeData。
       const syncData = promise ? tryResolveSync(promise) : undefined
       const rawData = state.data === undefined ? syncData?.data : state.data
       const data =
@@ -350,6 +374,9 @@ export function hydrate(
       const existingQueryIsFetching = query?.state.fetchStatus === 'fetching'
 
       // Do not hydrate if an existing query exists with newer data
+      // 已存在分支：只在「快照更新」时 setState，并且刻意剔除 fetchStatus ——
+      // 客户端当前的取数状态不能被服务端快照覆盖。
+      // 另有一条特判：快照是 pending 但此时已有 data（promise 先落地了），视为 success。
       if (query) {
         const hasNewerSyncData =
           syncData && dehydratedAt > query.state.dataUpdatedAt
@@ -410,6 +437,10 @@ export function hydrate(
         )
       }
 
+      // 恢复在途请求：条件四连，缺一不可 ——
+      //   有 promise、没有同步拿到数据、客户端该 query 不是 pending/fetching、快照比现有数据新。
+      // query.fetch 传 initialPromise 时「不会真的调用 queryFn」，只建一个 retryer 去 await 那个 promise。
+      // 这是「服务端已发出的请求，客户端不重发、只等结果」的实现。
       if (
         promise &&
         // If the data was synchronously available, there is no need to set up

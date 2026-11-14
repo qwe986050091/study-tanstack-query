@@ -70,6 +70,16 @@ type StreamedQueryParams<TQueryFnData, TData, TQueryKey extends QueryKey> =
  * })
  * ```
  */
+// ═══ 中文注释导读 ═══
+// streamedQuery 是「一个 queryFn 的工厂」：把 AsyncIterable 的每个 chunk 增量写进缓存。
+// 因为写缓存走 setQueryData，组件会在流的过程中持续收到新结果（不用等流结束）。
+// 三种 refetchMode 的差异（第二次及以后取数时生效）：
+//   reset（默认）：先清空数据并回到 pending，再重新累积；
+//   append：在已有数据后面继续追加；
+//   replace：流期间只累积在局部变量里，结束后一次性写入 —— 避免用户看到「半新半旧」。
+// 取消语义：只有当调用方读过 signal 时才会真正中断；没读 signal 时，
+//   最后一个 observer 退订后流仍会跑完（与 Query.removeObserver 的 cancelRetry 行为一致）。
+// ──────────────────────
 export function streamedQuery<
   TQueryFnData = unknown,
   TData = Array<TQueryFnData>,
@@ -94,7 +104,11 @@ export function streamedQuery<
     const query = context.client
       .getQueryCache()
       .find({ queryKey: context.queryKey, exact: true })
+    // isRefetch 的判定基于「这个 query 之前尝试过取数」，而不是「本次是否被手动 refetch」。
+    // 首次加载时 refetchMode 不起作用（没有旧数据可 reset/append/replace）。
     const isRefetch = !!query && query.isFetched()
+    // reset 模式必须手动清数据：正常 fetch 不会主动清空旧 data（那会闪屏），
+    // 而流式场景需要「从头开始」的语义。fetchStatus 设成 fetching 是为了让 UI 显示加载中。
     if (isRefetch && refetchMode === 'reset') {
       query.setState({
         ...query.resetState,
@@ -130,6 +144,8 @@ export function streamedQuery<
         break
       }
 
+      // replace 模式：只更新局部 result，不写缓存；循环结束后统一写。
+      // 其余模式：每个 chunk 立刻 setQueryData，updater 拿到的是「当前缓存值」。
       if (isReplaceRefetch) {
         // don't append to the cache directly when replace-refetching
         result = reducer(result, chunk)
@@ -141,6 +157,7 @@ export function streamedQuery<
     }
 
     // finalize result: replace-refetching needs to write to the cache
+    // 被取消时故意不写：保证「取消后缓存里不会出现一个只装了一半的新结果」。
     if (isReplaceRefetch && !isStreamInactive()) {
       context.client.setQueryData<TData>(context.queryKey, result)
     }
